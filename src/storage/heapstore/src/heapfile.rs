@@ -2,90 +2,143 @@ use crate::page::Page;
 use common::prelude::*;
 use common::PAGE_SIZE;
 use std::fs::{File, OpenOptions};
-use std::io::prelude::*;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 
-//use std::io::BufWriter;
-use std::io::{Seek, SeekFrom};
+/// Byte size of a single page on disk, cast to u64 for use in seek offset calculations
+const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 
-/// The struct for a heap file.  
+/// The struct for a heap file.
 ///
-/// HINT: You likely will want to design for interior mutability for concurrent accesses.
-/// eg Arc<RwLock<>> on some internal members
+/// Uses interior mutability (`Arc<RwLock<File>>`) to allow concurrent reads and writes
+/// without requiring a mutable reference to the HeapFile itself.
 ///
-/// HINT: You will probably not be able to serialize HeapFile, as it needs to maintain a link to a
-/// File object, which cannot be serialized/deserialized/skipped by serde. You don't need to worry
-/// about persisting read_count/write_count during serialization.
-///
-/// Your code should persist what information is needed to recreate the heapfile.
-///
+/// Note: HeapFile cannot be serialized — callers should persist the file path and
+/// container_id separately to reconstruct it on restart.
 pub(crate) struct HeapFile {
+    /// The underlying file handle, shared and protected by a read-write lock
     pub file: Arc<RwLock<File>>,
-    // Track this HeapFile's container Id
+    /// The container this heap file belongs to
     pub container_id: ContainerId,
-    // The following are for profiling/ correctness checks
+    /// Number of pages read from this file (used for profiling)
     pub read_count: AtomicU16,
+    /// Number of pages written to this file (used for profiling)
     pub write_count: AtomicU16,
 }
 
-/// HeapFile required functions
 impl HeapFile {
-    /// Create a new heapfile for the given path. Return Result<Self> if able to create.
-    /// Errors could arise from permissions, space, etc when trying to create the file used by HeapFile.
+    /// Opens or creates a heap file at the given path for the given container.
+    /// Returns an error if the file cannot be opened due to permissions, missing
+    /// directories, or other OS-level issues.
     pub(crate) fn new(file_path: PathBuf, container_id: ContainerId) -> Result<Self, CrustyError> {
-        let file = match OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&file_path)
-        {
-            Ok(f) => f,
-            Err(error) => {
-                return Err(CrustyError::CrustyError(format!(
+            .map_err(|error| {
+                CrustyError::CrustyError(format!(
                     "Cannot open or create heap file: {} {:?}",
                     file_path.to_string_lossy(),
                     error
-                )))
-            }
-        };
-        panic!("TODO milestone hs");
+                ))
+            })?;
+
+        Ok(HeapFile {
+            file: Arc::new(RwLock::new(file)),
+            container_id,
+            read_count: AtomicU16::new(0),
+            write_count: AtomicU16::new(0),
+        })
     }
 
-    /// Return the number of pages for this HeapFile.
-    /// Return type is PageId (alias for another type) as we cannot have more
-    /// pages than PageId can hold.
+    /// Returns the number of pages currently stored in this heap file.
+    /// Computed from the file size divided by PAGE_SIZE.
     pub fn num_pages(&self) -> PageId {
-        panic!("TODO milestone hs");
+        let file = match self.file.read() {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        (file_len / PAGE_SIZE_U64) as PageId
     }
 
-    /// Read the page from the file.
-    /// Errors could arise from the filesystem or invalid pageId
-    /// Note: that std::io::{Seek, SeekFrom} require Write locks on the underlying std::fs::File
-    pub(crate) fn read_page_from_file(&self, pid: PageId) -> Result<Page, CrustyError> {
-        //If profiling count reads
+    /// Reads and deserializes the page at the given page_id from disk.
+    /// Returns an error if the page_id is out of range or the read fails.
+    ///
+    /// Note: Seeking requires a mutable file handle, so this clones the file
+    /// descriptor rather than holding the read lock across the seek+read.
+    pub(crate) fn read_page_from_file(&self, page_id: PageId) -> Result<Page, CrustyError> {
         #[cfg(feature = "profile")]
         {
             self.read_count.fetch_add(1, Ordering::Relaxed);
         }
-        panic!("TODO milestone hs");
+
+        let file = self.file.read().map_err(|error| {
+            CrustyError::CrustyError(format!("Failed to acquire read lock on heap file: {:?}", error))
+        })?;
+
+        // Clone the file descriptor so we can seek without holding the lock
+        let mut file_handle = file.try_clone().expect("OS failed to clone file handle");
+        drop(file);
+
+        let byte_offset = page_id as u64 * PAGE_SIZE_U64;
+        let mut buffer = [0u8; PAGE_SIZE];
+
+        file_handle
+            .seek(SeekFrom::Start(byte_offset))
+            .map_err(|e| CrustyError::CrustyError(format!("Seek failed for page {}: {:?}", page_id, e)))?;
+
+        file_handle
+            .read_exact(&mut buffer)
+            .map_err(|e| CrustyError::CrustyError(format!("Read failed for page {}: {:?}", page_id, e)))?;
+
+        Ok(Page::from_bytes(buffer))
     }
 
-    /// Take a page and write it to the underlying file.
-    /// This could be an existing page or a new page
+    /// Serializes and writes the given page to its position in the heap file.
+    /// The write position is determined by the page's own page_id.
+    /// This can write to an existing page (update) or extend the file (new page).
     pub(crate) fn write_page_to_file(&self, page: &Page) -> Result<(), CrustyError> {
         trace!(
-            "Writing page {} to file {}",
+            "Writing page {} to container {}",
             page.get_page_id(),
             self.container_id
         );
-        //If profiling count writes
+
         #[cfg(feature = "profile")]
         {
             self.write_count.fetch_add(1, Ordering::Relaxed);
         }
-        panic!("TODO milestone hs");
+
+        let page_id = page.get_page_id();
+        let page_data = page.to_bytes();
+        let byte_offset = page_id as u64 * PAGE_SIZE_U64;
+
+        let mut file = self.file.write().map_err(|error| {
+            CrustyError::CrustyError(format!("Failed to acquire write lock on heap file: {:?}", error))
+        })?;
+
+        file.seek(SeekFrom::Start(byte_offset))
+            .map_err(|e| CrustyError::CrustyError(format!("Seek failed for page {}: {:?}", page_id, e)))?;
+
+        file.write_all(page_data)
+            .map_err(|e| CrustyError::CrustyError(format!("Write failed for page {}: {:?}", page_id, e)))?;
+
+        Ok(())
+    }
+
+    /// Returns the total size of the heap file in bytes.
+    pub(crate) fn get_file_size(&self) -> usize {
+        let file = match self.file.read() {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+
+        file.metadata().map(|m| m.len()).unwrap_or(0) as usize
     }
 }
 

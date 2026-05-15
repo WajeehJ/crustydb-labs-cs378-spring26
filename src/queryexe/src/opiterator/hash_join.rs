@@ -3,32 +3,49 @@ use crate::Managers;
 
 use common::bytecode_expr::ByteCodeExpr;
 use common::{CrustyError, Field, TableSchema, Tuple};
+use core::hash;
 use std::collections::HashMap;
 
 /// Hash equi-join implementation. (You can add any other fields that you think are neccessary)
+/// A hash equality join operator that builds a hash table from the left child
+/// and probes it with tuples from the right child.
 pub struct HashEqJoin {
-    // Static objects (No need to reset on close)
+    // Static objects (no need to reset on close)
     managers: &'static Managers,
 
-    // Parameters (No need to reset on close)
+    // Parameters (no need to reset on close)
     schema: TableSchema,
     left_expr: ByteCodeExpr,
     right_expr: ByteCodeExpr,
     left_child: Box<dyn OpIterator>,
     right_child: Box<dyn OpIterator>,
-    // States (Need to reset on close)
-    // todo!("Your code here")
+
+    /// Hash table mapping a left-side join key to all left tuples with that key.
+    hash_map: HashMap<Field, Vec<Tuple>>,
+
+    /// Iterator over the current bucket of left tuples matching the current right tuple.
+    current_bucket_iter: Option<std::vec::IntoIter<Tuple>>,
+
+    /// The right-side tuple currently being probed against the hash table.
+    current_right_tuple: Option<Tuple>,
+
+    /// Whether the build phase (consuming all left child tuples) is complete.
+    hash_map_complete: bool,
+
+    /// Whether the operator has been opened.
+    open: bool,
 }
 
 impl HashEqJoin {
-    /// NestedLoopJoin constructor. Creates a new node for a nested-loop join.
+    /// Creates a new HashEqJoin operator node.
     ///
     /// # Arguments
-    ///
-    /// * `left_expr` - ByteCodeExpr for the left field in join condition.
-    /// * `right_expr` - ByteCodeExpr for the right field in join condition.
-    /// * `left_child` - Left child of join operator.
-    /// * `right_child` - Left child of join operator.
+    /// * `managers` - Reference to the global managers.
+    /// * `schema` - The output schema of this join operator.
+    /// * `left_expr` - Expression to extract the join key from left-side tuples.
+    /// * `right_expr` - Expression to extract the join key from right-side tuples.
+    /// * `left_child` - The left child operator (used for the build phase).
+    /// * `right_child` - The right child operator (used for the probe phase).
     pub fn new(
         managers: &'static Managers,
         schema: TableSchema,
@@ -37,30 +54,107 @@ impl HashEqJoin {
         left_child: Box<dyn OpIterator>,
         right_child: Box<dyn OpIterator>,
     ) -> Self {
-        todo!("Your code here")
+        HashEqJoin {
+            managers,
+            left_expr,
+            right_expr,
+            left_child,
+            right_child,
+            schema,
+            hash_map: HashMap::new(),
+            hash_map_complete: false,
+            current_bucket_iter: None,
+            current_right_tuple: None,
+            open: false,
+        }
     }
 }
 
 impl OpIterator for HashEqJoin {
     fn configure(&mut self, will_rewind: bool) {
-        self.left_child.configure(false); // left child will never be rewound by HJ
+        // The left child is fully consumed during the build phase and never rewound
+        self.left_child.configure(false);
         self.right_child.configure(will_rewind);
     }
 
     fn open(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.open()?;
+        self.right_child.open()?;
+        self.open = true;
+        Ok(())
     }
 
+    /// Advances the iterator, returning the next joined output tuple.
+    ///
+    /// On the first call, completes the build phase by consuming all left child tuples
+    /// into the hash table. Subsequent calls probe the hash table with right-side tuples.
     fn next(&mut self) -> Result<Option<Tuple>, CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened");
+        }
+
+        loop {
+            // Phase 1: Build — consume all left child tuples into the hash table
+            while !self.hash_map_complete {
+                match self.left_child.next()? {
+                    Some(left_tuple) => {
+                        let join_key = self.left_expr.eval(&left_tuple);
+                        self.hash_map
+                            .entry(join_key)
+                            .or_insert_with(Vec::new)
+                            .push(left_tuple);
+                    }
+                    None => self.hash_map_complete = true,
+                }
+            }
+
+            // Phase 2: Probe — if we are mid-bucket, return the next matching joined tuple
+            if let Some(ref mut bucket_iter) = self.current_bucket_iter {
+                if let Some(left_tuple) = bucket_iter.next() {
+                    // Merge the matching left tuple with the current right tuple
+                    let joined_tuple = left_tuple.merge(self.current_right_tuple.as_ref().unwrap());
+                    return Ok(Some(joined_tuple));
+                } else {
+                    // Current bucket exhausted; advance to the next right tuple
+                    self.current_bucket_iter = None;
+                    self.current_right_tuple = None;
+                }
+            }
+
+            // Phase 3: Advance — fetch the next right tuple and look up its hash bucket
+            if self.current_right_tuple.is_none() {
+                match self.right_child.next()? {
+                    Some(right_tuple) => {
+                        let probe_key = self.right_expr.eval(&right_tuple);
+                        self.current_right_tuple = Some(right_tuple);
+
+                        if let Some(matching_bucket) = self.hash_map.get(&probe_key) {
+                            // Clone the bucket to create an owned iterator over matching left tuples
+                            self.current_bucket_iter =
+                                Some(matching_bucket.clone().into_iter());
+                        } else {
+                            // No matching left tuples; discard this right tuple and continue
+                            self.current_right_tuple = None;
+                        }
+                    }
+                    // Right child exhausted; join is complete
+                    None => return Ok(None),
+                }
+            }
+        }
     }
 
     fn close(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.close()?;
+        self.right_child.close()?;
+        self.open = false;
+        Ok(())
     }
 
     fn rewind(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        // Only the right child needs to rewind; the left hash table remains intact
+        self.right_child.rewind()?;
+        Ok(())
     }
 
     fn get_schema(&self) -> &TableSchema {

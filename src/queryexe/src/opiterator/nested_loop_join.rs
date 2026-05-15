@@ -5,30 +5,36 @@ use common::datatypes::compare_fields;
 use common::{BooleanOp, CrustyError, TableSchema, Tuple};
 
 /// Nested loop join implementation. (You can add any other fields that you think are neccessary)
+/// A nested loop join operator that evaluates a boolean join condition
+/// by iterating the right child once for every tuple in the left child.
 pub struct NestedLoopJoin {
-    // Parameters (No need to reset on close)
+    // Parameters (no need to reset on close)
     schema: TableSchema,
+    /// The boolean comparison operation used in the join predicate.
     op: BooleanOp,
+    /// Expression to extract the join key from left-side tuples.
     left_expr: ByteCodeExpr,
+    /// Expression to extract the join key from right-side tuples.
     right_expr: ByteCodeExpr,
     left_child: Box<dyn OpIterator>,
-    right_child: Box<dyn OpIterator>
+    right_child: Box<dyn OpIterator>,
 
-    // TODO: Add any other fields that you need to
-    // maintain operator state here
-
+    /// The current left-side tuple being probed against the entire right child.
+    current_left_tuple: Option<Tuple>,
+    /// Whether the operator has been opened.
+    open: bool,
 }
 
 impl NestedLoopJoin {
-    /// NestedLoopJoin constructor. Creates a new node for a nested-loop join.
+    /// Creates a new NestedLoopJoin operator node.
     ///
     /// # Arguments
-    ///
-    /// * `op` - Operation in join condition.
-    /// * `left_expr` - ByteCodeExpr for the left field in join condition.
-    /// * `right_expr` - ByteCodeExpr for the right field in join condition.
-    /// * `left_child` - Left child of join operator.
-    /// * `right_child` - Left child of join operator.
+    /// * `op` - The boolean comparison operation for the join predicate.
+    /// * `left_expr` - Expression to extract the join key from left-side tuples.
+    /// * `right_expr` - Expression to extract the join key from right-side tuples.
+    /// * `left_child` - The left (outer) child operator.
+    /// * `right_child` - The right (inner) child operator, rewound for each left tuple.
+    /// * `schema` - The output schema of this join operator.
     pub fn new(
         op: BooleanOp,
         left_expr: ByteCodeExpr,
@@ -37,39 +43,89 @@ impl NestedLoopJoin {
         right_child: Box<dyn OpIterator>,
         schema: TableSchema,
     ) -> Self {
-        todo!("Your code here")
+        NestedLoopJoin {
+            op,
+            left_expr,
+            right_expr,
+            left_child,
+            right_child,
+            schema,
+            current_left_tuple: None,
+            open: false,
+        }
     }
 }
 
 impl OpIterator for NestedLoopJoin {
     fn configure(&mut self, will_rewind: bool) {
         self.left_child.configure(will_rewind);
-        self.right_child.configure(true); // right child will always be rewound by NLJ
+        // The right child is always rewound after each left tuple, so it must support rewind
+        self.right_child.configure(true);
     }
 
     fn open(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.open()?;
+        self.right_child.open()?;
+        self.open = true;
+        Ok(())
     }
 
-    /// Calculates the next tuple for a nested loop join.
+    /// Advances the iterator, returning the next joined output tuple.
+    ///
+    /// For each left tuple, scans the entire right child looking for tuples
+    /// that satisfy the join predicate. When the right child is exhausted,
+    /// it is rewound and the next left tuple is fetched.
     fn next(&mut self) -> Result<Option<Tuple>, CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Operator has not been opened");
+        }
+
+        loop {
+            // Fetch the next left (outer) tuple if we don't have one
+            if self.current_left_tuple.is_none() {
+                match self.left_child.next()? {
+                    Some(left_tuple) => self.current_left_tuple = Some(left_tuple),
+                    // Left child exhausted; join is complete
+                    None => return Ok(None),
+                }
+            }
+
+            // Scan the right child for tuples satisfying the join predicate
+            while let Some(right_tuple) = self.right_child.next()? {
+                let left_key = self.left_expr.eval(self.current_left_tuple.as_ref().unwrap());
+                let right_key = self.right_expr.eval(&right_tuple);
+
+                if compare_fields(self.op, &left_key, &right_key) {
+                    // Predicate satisfied; merge and return the joined tuple
+                    let joined_tuple = self.current_left_tuple.as_ref().unwrap().merge(&right_tuple);
+                    return Ok(Some(joined_tuple));
+                }
+            }
+
+            // Right child exhausted for this left tuple; rewind and advance the left child
+            self.right_child.rewind()?;
+            self.current_left_tuple = None;
+        }
     }
 
     fn close(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.close()?;
+        self.right_child.close()?;
+        self.open = false;
+        Ok(())
     }
 
     fn rewind(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.left_child.rewind()?;
+        self.right_child.rewind()?;
+        Ok(())
     }
 
-    /// return schema of the result
+    /// Returns the output schema of this join operator.
     fn get_schema(&self) -> &TableSchema {
         &self.schema
     }
 }
-
 #[cfg(test)]
 mod test {
     use super::super::TupleIterator;

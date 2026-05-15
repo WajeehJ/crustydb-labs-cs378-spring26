@@ -5,8 +5,11 @@ use common::datatypes::f_decimal;
 use common::{AggOp, CrustyError, Field, TableSchema, Tuple};
 use std::cmp::{max, min};
 use std::collections::HashMap;
+use std::collections::hash_map::IntoIter;
 
 /// Aggregate operator. (You can add any other fields that you think are neccessary)
+/// 
+/// 
 pub struct Aggregate {
     // Static objects (No need to reset on close)
     managers: &'static Managers,
@@ -24,12 +27,40 @@ pub struct Aggregate {
     child: Box<dyn OpIterator>,
     /// If true, then the operator will be rewinded in the future.
     will_rewind: bool,
+    hash_map: HashMap<Vec<Field>, Vec<AggState>>,
+    current_list_iter: Option<IntoIter<Vec<Field>, Vec<AggState>>>,
+    open: bool,
+    results: Option<Vec<Tuple>>, 
+    cursor: usize,
     
     // States (Need to reset on close)
     // todo!("Your code here")
 }
 
+/// Represents the state of an aggregation operation during processing.
+/// 
+/// - `Value`: Used for Min, Max, Sum, and Count operations, storing the current accumulated field.
+/// - `AvgState`: Used for Average operations, storing the running sum and the count of values seen.
+enum AggState {
+    Value(Field),
+    AvgState(Field, i64),
+}
+
+/// Scale factor used when converting a floating-point average to a fixed-point Decimal field.
+/// Represents 4 decimal places of precision (i.e., multiply by 10^4 = 10000).
+const AVG_DECIMAL_SCALE: u32 = 4;
+const AVG_DECIMAL_MULTIPLIER: f64 = 10_000.0;
+
 impl Aggregate {
+    /// Creates a new Aggregate operator.
+    ///
+    /// # Arguments
+    /// * `managers` - Reference to the global managers.
+    /// * `groupby_expr` - Expressions used to compute the group-by key for each tuple.
+    /// * `agg_expr` - Expressions used to extract the value to aggregate from each tuple.
+    /// * `ops` - Aggregation operations (e.g., Sum, Avg) corresponding to each `agg_expr`.
+    /// * `schema` - The output schema of this operator.
+    /// * `child` - The child operator that produces input tuples.
     pub fn new(
         managers: &'static Managers,
         groupby_expr: Vec<ByteCodeExpr>,
@@ -38,64 +69,225 @@ impl Aggregate {
         schema: TableSchema,
         child: Box<dyn OpIterator>,
     ) -> Self {
-        assert!(ops.len() == agg_expr.len());
-        todo!("Your code here")
+        assert!(
+            ops.len() == agg_expr.len(),
+            "ops and agg_expr must have the same length"
+        );
+        Aggregate {
+            managers,
+            schema,
+            groupby_expr,
+            agg_expr,
+            ops,
+            child,
+            will_rewind: true,
+            hash_map: HashMap::new(),
+            open: false,
+            current_list_iter: None,
+            results: None,
+            cursor: 0,
+        }
     }
 
-    fn merge_fields(op: AggOp, field_val: &Field, acc: &mut Field) -> Result<(), CrustyError> {
-        match op {
-            AggOp::Count => *acc = (acc.clone() + Field::Int(1))?,
-            AggOp::Max => {
-                let max = max(acc.clone(), field_val.clone());
-                *acc = max;
+    /// Merges a single field value into an accumulator state for a given aggregation operation.
+    ///
+    /// Null field values are ignored (treated as no-ops) per standard SQL aggregation semantics.
+    ///
+    /// # Arguments
+    /// * `op` - The aggregation operation to apply.
+    /// * `field_val` - The new field value to incorporate.
+    /// * `acc` - The mutable accumulator state to update.
+    ///
+    /// # Errors
+    /// Returns a `CrustyError` if the field arithmetic operation fails.
+    fn merge_fields(
+        op: AggOp,
+        field_val: &Field,
+        acc: &mut AggState,
+    ) -> Result<(), CrustyError> {
+        // SQL semantics: null values are ignored in aggregations
+        if let Field::Null = field_val {
+            return Ok(());
+        }
+
+        match (op, acc) {
+            (AggOp::Min, AggState::Value(acc_val)) => {
+                if let Field::Null = acc_val {
+                    *acc_val = field_val.clone();
+                } else if field_val < acc_val {
+                    *acc_val = field_val.clone();
+                }
             }
-            AggOp::Min => {
-                let min = min(acc.clone(), field_val.clone());
-                *acc = min;
+
+            (AggOp::Max, AggState::Value(acc_val)) => {
+                if let Field::Null = acc_val {
+                    *acc_val = field_val.clone();
+                } else if field_val > acc_val {
+                    *acc_val = field_val.clone();
+                }
             }
-            AggOp::Sum => {
-                *acc = (acc.clone() + field_val.clone())?;
+
+            (AggOp::Sum, AggState::Value(acc_val)) => {
+                if let Field::Null = acc_val {
+                    *acc_val = field_val.clone();
+                } else {
+                    *acc_val = (acc_val.clone() + field_val.clone())?;
+                }
             }
-            AggOp::Avg => {
-                *acc = (acc.clone() + field_val.clone())?; // This will be divided by the count later
+
+            (AggOp::Avg, AggState::AvgState(running_sum, count)) => {
+                if let Field::Null = running_sum {
+                    *running_sum = field_val.clone();
+                } else {
+                    *running_sum = (running_sum.clone() + field_val.clone())?;
+                }
+                *count += 1;
             }
+
+            (AggOp::Count, AggState::Value(count_field)) => {
+                if let Field::Null = count_field {
+                    *count_field = Field::Int(1);
+                } else {
+                    *count_field = (count_field.clone() + Field::Int(1))?;
+                }
+            }
+
+            _ => panic!("Mismatched AggOp and AggState variant"),
         }
         Ok(())
     }
 
+    /// Evaluates the group-by key and aggregation expressions for a tuple,
+    /// then merges the result into the appropriate group entry in the hash map.
+    ///
+    /// # Arguments
+    /// * `tuple` - The input tuple to incorporate into a group.
     pub fn merge_tuple_into_group(&mut self, tuple: &Tuple) {
-        todo!("Your code here");
+        // Compute the group-by key by evaluating each group-by expression
+        let group_key: Vec<Field> = self
+            .groupby_expr
+            .iter()
+            .map(|expr| expr.eval(tuple))
+            .collect();
+
+        // Initialize accumulator states for a new group, or retrieve the existing ones
+        let agg_states = self.hash_map.entry(group_key).or_insert_with(|| {
+            self.ops
+                .iter()
+                .map(|op| match op {
+                    // Avg tracks sum and count separately
+                    AggOp::Avg => AggState::AvgState(Field::Int(0), 0),
+                    // All other ops start with a null accumulator
+                    _ => AggState::Value(Field::Null),
+                })
+                .collect()
+        });
+
+        // Merge each aggregation expression's value into its corresponding state
+        for (index, op) in self.ops.iter().enumerate() {
+            let field_val = self.agg_expr[index].eval(tuple);
+            let state = &mut agg_states[index];
+            Self::merge_fields(*op, &field_val, state).expect("Merge failed");
+        }
     }
 }
 
 impl OpIterator for Aggregate {
     fn configure(&mut self, will_rewind: bool) {
         self.will_rewind = will_rewind;
-        self.child.configure(false); // child of a aggregate will never be rewinded
-                                     // because aggregate will buffer all the tuples from the child
+        // The child will never be rewound because the aggregate buffers all child tuples
+        self.child.configure(false);
     }
 
     fn open(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.child.open()?;
+        self.open = true;
+        Ok(())
     }
 
+    /// Advances the iterator, returning the next aggregated output tuple.
+    ///
+    /// On the first call, consumes all child tuples and materializes the aggregation results.
+    /// Subsequent calls iterate over the buffered results.
     fn next(&mut self) -> Result<Option<Tuple>, CrustyError> {
-        todo!("Your code here")
+        // Materialize results on the first call to next()
+        if self.results.is_none() {
+            // Consume all tuples from the child and accumulate into groups
+            while let Some(child_tuple) = self.child.next()? {
+                self.merge_tuple_into_group(&child_tuple);
+            }
+
+            // Convert each group's accumulated state into a final output tuple
+            let mut final_tuples = Vec::new();
+            for (group_key_fields, agg_states) in std::mem::take(&mut self.hash_map) {
+                // Start with the group-by key fields, then append aggregated values
+                let mut output_row = group_key_fields;
+
+                for state in agg_states {
+                    match state {
+                        AggState::Value(value) => output_row.push(value),
+
+                        AggState::AvgState(running_sum, count) => {
+                            // Convert the running sum to f64 for division
+                            let sum_as_f64 = match running_sum {
+                                Field::Int(integer_val) => integer_val as f64,
+                                Field::Decimal(raw_val, scale) => {
+                                    // Normalize fixed-point decimal to f64
+                                    raw_val as f64 / 10f64.powi(scale as i32)
+                                }
+                                _ => 0.0,
+                            };
+
+                            let average = sum_as_f64 / (count as f64);
+
+                            // Store as a fixed-point Decimal with AVG_DECIMAL_SCALE precision
+                            output_row.push(Field::Decimal(
+                                (average * AVG_DECIMAL_MULTIPLIER) as i64,
+                                AVG_DECIMAL_SCALE,
+                            ));
+                        }
+                    }
+                }
+
+                final_tuples.push(Tuple::new(output_row));
+            }
+
+            self.results = Some(final_tuples);
+            self.cursor = 0;
+        }
+
+        // Return the next buffered result tuple, or None if exhausted
+        let results_vec = self.results.as_ref().unwrap();
+        if self.cursor < results_vec.len() {
+            let next_tuple = results_vec[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(next_tuple))
+        } else {
+            Ok(None)
+        }
     }
 
     fn close(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        self.child.close()?;
+        self.hash_map.clear();
+        self.current_list_iter = None;
+        self.open = false;
+        Ok(())
     }
 
     fn rewind(&mut self) -> Result<(), CrustyError> {
-        todo!("Your code here")
+        if !self.open {
+            panic!("Tried rewinding while closed");
+        }
+        // Reset cursor to replay buffered results from the beginning
+        self.cursor = 0;
+        Ok(())
     }
 
     fn get_schema(&self) -> &TableSchema {
         &self.schema
     }
 }
-
 #[cfg(test)]
 mod test {
     use super::super::TupleIterator;

@@ -2,96 +2,288 @@ use crate::page;
 use crate::page::{Offset, Page};
 use common::prelude::*;
 use common::PAGE_SIZE;
+use std::cmp::Reverse;
 use std::fmt;
 use std::fmt::Write;
-// todo!("Add any other imports you need here")
 
-// Add any other constants, type aliases, or structs, or definitions here
+/// Size of the fixed header portion (num_slots, free pointer, free space)
+const HEADER_BASE_SIZE: usize = 8;
 
+/// Size of a single slot entry: (slot_id, offset, length)
+const SLOT_ENTRY_SIZE: usize = 6;
+
+/// Trait defining heap page behavior
 pub trait HeapPage {
-    // Do not change these functions signatures (only the function bodies)
     fn add_value(&mut self, bytes: &[u8]) -> Option<SlotId>;
     fn get_value(&self, slot_id: SlotId) -> Option<Vec<u8>>;
     fn delete_value(&mut self, slot_id: SlotId) -> Option<()>;
     fn get_header_size(&self) -> usize;
     fn get_free_space(&self) -> usize;
 
-    //Add function signatures for any helper function you need here
+    /// Returns number of slots in the page
+    fn get_num_slots(&self) -> usize;
+
+    /// Returns offset where free space begins
+    fn get_offset_into_free(&self) -> usize;
+
+    /// Compacts fragmented data into contiguous free space
+    fn compaction(&mut self);
 }
 
 impl HeapPage for Page {
-    /// Attempts to add a new value to this page if there is space available.
-    /// Returns Some(SlotId) if it was inserted or None if there was not enough space.
-    /// Note that where the bytes are stored in the page does not matter (heap), but it
-    /// should not change the slotId for any existing value. This means that
-    /// bytes in the page may not follow the slot order.
-    /// If a slot is deleted you should reuse the slotId in the future.
-    /// The page should always assign the lowest available slot_id to an insertion.
-    ///
-    /// HINT: You can copy/clone bytes into a slice using the following function.
-    /// They must have the same size.
-    /// self.data[X..y].clone_from_slice(&bytes);
+    /// Inserts bytes into the heap page if space allows.
+    /// Reuses lowest available slot ID if possible.
     fn add_value(&mut self, bytes: &[u8]) -> Option<SlotId> {
-        todo!("Your code here")
+        let mut num_slots = self.get_num_slots();
+        let mut free_space_pointer = self.get_offset_into_free();
+
+        let header_start = HEADER_BASE_SIZE;
+        let header_end = header_start + num_slots * SLOT_ENTRY_SIZE;
+
+        let mut target_slot_index: Option<usize> = None;
+        let mut next_slot_id: SlotId = 0;
+
+        // Search for empty slot
+        for (index, chunk) in self.data[header_start..header_end]
+            .chunks_exact(SLOT_ENTRY_SIZE)
+            .enumerate()
+        {
+            let offset = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
+            if offset == 0 {
+                target_slot_index = Some(index);
+                next_slot_id = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
+                break;
+            }
+            next_slot_id = u16::from_le_bytes(chunk[0..2].try_into().unwrap()) + 1;
+        }
+
+        let required_space = bytes.len();
+        let slot_growth = if target_slot_index.is_none() {
+            SLOT_ENTRY_SIZE
+        } else {
+            0
+        };
+
+        // Check space and compact if necessary
+        if header_end + slot_growth + required_space > free_space_pointer {
+            if self.get_free_space() >= slot_growth + required_space {
+                self.compaction();
+                free_space_pointer = self.get_offset_into_free();
+            } else {
+                return None;
+            }
+        }
+
+        // Determine slot position
+        let slot_position = if let Some(index) = target_slot_index {
+            header_start + index * SLOT_ENTRY_SIZE
+        } else {
+            num_slots += 1;
+            self.data[2..4].copy_from_slice(&(num_slots as u16).to_le_bytes());
+            header_end
+        };
+
+        // Write value bytes
+        let new_data_start = free_space_pointer - bytes.len();
+        self.data[new_data_start..free_space_pointer].copy_from_slice(bytes);
+
+        // Write slot entry
+        self.data[slot_position..slot_position + 2]
+            .copy_from_slice(&(next_slot_id as u16).to_le_bytes());
+        self.data[slot_position + 2..slot_position + 4]
+            .copy_from_slice(&(new_data_start as u16).to_le_bytes());
+        self.data[slot_position + 4..slot_position + 6]
+            .copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+
+        // Update free space pointer
+        self.data[4..6].copy_from_slice(&(new_data_start as u16).to_le_bytes());
+
+        // Update free space amount
+        let updated_free_space =
+            (self.get_free_space() - required_space - slot_growth) as u16;
+        self.data[6..8].copy_from_slice(&updated_free_space.to_le_bytes());
+
+        Some(next_slot_id)
     }
 
-    /// Return the bytes for the slotId. If the slotId is not valid then return None
+    /// Retrieves bytes for the given slot ID
     fn get_value(&self, slot_id: SlotId) -> Option<Vec<u8>> {
-        todo!("Your code here")
+        let num_slots = self.get_num_slots();
+        let header_start = HEADER_BASE_SIZE;
+        let header_end = header_start + num_slots * SLOT_ENTRY_SIZE;
+
+        for chunk in self.data[header_start..header_end].chunks_exact(SLOT_ENTRY_SIZE) {
+            let current_slot_id =
+                u16::from_le_bytes(chunk[0..2].try_into().unwrap()) as SlotId;
+
+            if current_slot_id == slot_id {
+                let offset = u16::from_le_bytes(chunk[2..4].try_into().unwrap()) as usize;
+                let size = u16::from_le_bytes(chunk[4..6].try_into().unwrap()) as usize;
+
+                if offset == 0 {
+                    return None;
+                }
+
+                return Some(self.data[offset..offset + size].to_vec());
+            }
+        }
+
+        None
     }
 
-    /// Delete the bytes/slot for the slotId. If the slotId is not valid then return None
-    /// The slotId for a deleted slot should be assigned to the next added value
-    /// The space for the value should be free to use for a later added value.
-    /// HINT: Return Some(()) for a valid delete
+    /// Deletes the value for a slot ID and marks slot as reusable
     fn delete_value(&mut self, slot_id: SlotId) -> Option<()> {
-        todo!("Your code here")
+        let num_slots = self.get_num_slots();
+        let header_start = HEADER_BASE_SIZE;
+        let header_end = header_start + num_slots * SLOT_ENTRY_SIZE;
+
+        for (index, chunk) in self.data[header_start..header_end]
+            .chunks_exact(SLOT_ENTRY_SIZE)
+            .enumerate()
+        {
+            let current_slot_id =
+                u16::from_le_bytes(chunk[0..2].try_into().unwrap()) as SlotId;
+
+            if current_slot_id == slot_id {
+                let size = u16::from_le_bytes(chunk[4..6].try_into().unwrap());
+                let new_free_space = size + self.get_free_space() as u16;
+
+                self.data[6..8].copy_from_slice(&new_free_space.to_le_bytes());
+
+                // Mark slot as empty
+                let slot_start = header_start + index * SLOT_ENTRY_SIZE;
+                self.data[slot_start + 2..slot_start + 6].fill(0);
+
+                return Some(());
+            }
+        }
+
+        None
     }
 
-    /// A utility function to determine the size of the header in the page
-    /// when serialized/to_bytes.
-    /// Will be used by tests.
-    #[allow(dead_code)]
+    /// Returns total header size
     fn get_header_size(&self) -> usize {
-        todo!("Your code here")
+        HEADER_BASE_SIZE + self.get_num_slots() * SLOT_ENTRY_SIZE
     }
 
-    /// A utility function to determine the total current free space in the page.
-    /// This should account for the header space used and space that could be reclaimed if needed.
-    /// Will be used by tests.
-    #[allow(dead_code)]
+    /// Returns total free space
     fn get_free_space(&self) -> usize {
-        todo!("Your code here")
+        u16::from_le_bytes(self.data[6..8].try_into().unwrap()) as usize
+    }
+
+    /// Returns pointer to free space start
+    fn get_offset_into_free(&self) -> usize {
+        u16::from_le_bytes(self.data[4..6].try_into().unwrap()) as usize
+    }
+
+    /// Returns number of slots
+    fn get_num_slots(&self) -> usize {
+        u16::from_le_bytes(self.data[2..4].try_into().unwrap()) as usize
+    }
+
+    /// Compacts page by shifting all valid records to the end of the page
+    fn compaction(&mut self) {
+        let mut active_slots: Vec<(usize, usize)> = Vec::new();
+
+        let num_slots = self.get_num_slots();
+        let header_start = HEADER_BASE_SIZE;
+        let header_end = header_start + num_slots * SLOT_ENTRY_SIZE;
+
+        for (index, chunk) in self.data[header_start..header_end]
+            .chunks_exact(SLOT_ENTRY_SIZE)
+            .enumerate()
+        {
+            let offset = u16::from_le_bytes(chunk[2..4].try_into().unwrap()) as usize;
+            if offset > 0 {
+                active_slots.push((index, offset));
+            }
+        }
+
+        active_slots.sort_by_key(|entry| Reverse(entry.1));
+
+        let mut current_offset = PAGE_SIZE;
+
+        for (slot_index, old_offset) in active_slots {
+            let slot_start = header_start + slot_index * SLOT_ENTRY_SIZE;
+            let size =
+                u16::from_le_bytes(self.data[slot_start + 4..slot_start + 6].try_into().unwrap())
+                    as usize;
+
+            let new_offset = current_offset - size;
+
+            self.data
+                .copy_within(old_offset..old_offset + size, new_offset);
+
+            self.data[slot_start + 2..slot_start + 4]
+                .copy_from_slice(&(new_offset as u16).to_le_bytes());
+
+            current_offset = new_offset;
+        }
+
+        self.data[4..6].copy_from_slice(&(current_offset as u16).to_le_bytes());
     }
 }
 
-/// The (consuming) iterator struct for a page.
-/// This should iterate through all valid values of the page.
+/// Iterator for consuming a HeapPage
 pub struct HeapPageIntoIter {
     page: Page,
-    // todo!("Add any fields you need here")
+    start: usize,
+    end: usize,
 }
 
-/// The implementation of the (consuming) page iterator.
-/// This should return the values in slotId order (ascending)
+impl HeapPageIntoIter {
+    pub fn new_at_slot(page: Page, slot_id: SlotId) -> Self {
+        let header_end = page.get_header_size();
+        
+        let seek_start = HEADER_BASE_SIZE + (slot_id as usize * SLOT_ENTRY_SIZE);
+
+        let safe_start = std::cmp::min(seek_start, header_end);
+
+        Self {
+            page,
+            start: safe_start,
+            end: header_end,
+        }
+    }
+}
+
 impl Iterator for HeapPageIntoIter {
-    // Each item returned by the iterator is the bytes for the value and the slot id.
     type Item = (Vec<u8>, SlotId);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!("Your code here")
+        while self.start < self.end {
+            let slot_chunk =
+                &self.page.to_bytes()[self.start..self.start + SLOT_ENTRY_SIZE];
+
+            let slot_id =
+                u16::from_le_bytes(slot_chunk[0..2].try_into().unwrap()) as SlotId;
+            let offset =
+                u16::from_le_bytes(slot_chunk[2..4].try_into().unwrap()) as usize;
+            let size =
+                u16::from_le_bytes(slot_chunk[4..6].try_into().unwrap()) as usize;
+
+            self.start += SLOT_ENTRY_SIZE;
+
+            if offset > 0 {
+                let bytes = self.page.data[offset..offset + size].to_vec();
+                return Some((bytes, slot_id));
+            }
+        }
+
+        None
     }
 }
 
-/// The implementation of IntoIterator which allows an iterator to be created
-/// for a page. This should create the PageIter struct with the appropriate state/metadata
-/// on initialization.
 impl IntoIterator for Page {
     type Item = (Vec<u8>, SlotId);
     type IntoIter = HeapPageIntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        todo!("Your code here")
+        HeapPageIntoIter {
+            start: HEADER_BASE_SIZE,
+            end: self.get_header_size(),
+            page: self,
+        }
     }
 }
 

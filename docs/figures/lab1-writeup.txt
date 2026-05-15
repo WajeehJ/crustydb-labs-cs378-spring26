@@ -1,0 +1,17 @@
+A brief description of your solution, in particular what design decisions you made and why. This is only needed for the parts of your solution that involved some significant work (e.g. just returning a counter or a pass through function isn't a design decision).
+
+I basically stored header information as offset, freespace and number of slots.
+Number of slots made it easy to iterate through the slots, and offset made it
+easy to write the data stored inside a tuple. The free space attribute allowed
+me to see when to compact and when to return None on a add. For slots, I stored 
+the offset, length and id. This made it easy to read data. When deleting, I just 
+set the offset to 0. This was so that slots could be reused. I did not compact
+immediately. I only compacted when space was available for an add but the actual data
+and header were going to overlap. 
+
+How long you roughly spent on the lab, and what you liked/disliked on the lab.
+
+I spent 5 hours on the lab. I enjoyed everything about the lab. 
+
+If you know some part of the lab is incomplete, write up what parts are not working, how close you think you are, and what part(s) you got stuck on.
+N/A

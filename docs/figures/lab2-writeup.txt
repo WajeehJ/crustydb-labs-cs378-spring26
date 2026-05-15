@@ -1,0 +1,7 @@
+A brief description of your solution, in particular what design decisions you took and why. This is only needed for part of your solutions that had some significant work 
+(e.g. just returning a counter or a pass through function has no design decision). - For the update function, I just deleted
+the value and readded to the database so that its easier to implement. For adding values, I just went through every page and
+tried adding it. If the add failed, then I would move on. If I exhausted everything, I added a new page. I also added a 
+constructor in my iterator to skip to a certain slot if it was needed. 
+How long you roughly spent on the lab, and what would have liked/disliked on the lab. - 3 hours 
+If you know some part of the lab is incomplete, write up what parts are not working, how close you think you are, and what part(s) you got stuck on. - NA

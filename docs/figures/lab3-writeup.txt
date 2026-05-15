@@ -1,0 +1,28 @@
+A brief description of your solution, in particular what design decisions you took and why. 
+This is only needed for part of your solutions that had some significant work 
+(e.g. just returning a counter or a pass through function has no design decision).
+
+Nested Loop Join - I simply implemented a loop that keeps track of the left child
+until it returns None. For each left child, it loops through the entirety of the 
+right child. 
+
+Hash Join - I implemented a hash map. First it loops until the hash map is fully
+materialized from the left side. Then from there, I would keep track of an iterator
+of the values from the hashmap that the current right child matches it so that
+it would emit one pair every time that next was invoked. 
+
+Aggregate - I implemented a hash aggregate as suggested by the lab instructions. 
+First I would materialize all of the results via a hash map. I used a vector of fields
+for the keys and applied each given function in the groupby_expr vector to group
+together keys inside of the map. Once that was complete, I stored all of the results
+in one vector and then kept track of a pointer to the next value. This is so that when 
+rewind is called, I don't rely on rewinding the child or the state of the hash map 
+(which gets cleared when you move the values from within it to a vector) and instead
+can simply just reset the cursor index. 
+
+How long you roughly spent on the lab, and what would have liked/disliked on the lab.
+I roughly spent 4 horus on the lab, and I enjoyed the lab entirely. 
+
+If you know some part of the lab is incomplete, write up what parts are not working, 
+how close you think you are, and what part(s) you got stuck on.
+N/A
